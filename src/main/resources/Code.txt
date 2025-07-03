@@ -1,0 +1,728 @@
+package com.ul.rams.util;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFParagraph;
+import org.apache.poi.xwpf.usermodel.XWPFTable;
+import org.apache.poi.xwpf.usermodel.XWPFTableCell;
+import org.apache.poi.xwpf.usermodel.XWPFTableRow;
+import org.springframework.stereotype.Component;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+
+@Component
+public class VigilanceWordDocumentParserUtil {
+
+	public static void main(String[] args) throws IOException {
+		String docxPath = "src/main/resources/NZ_Adverse.docx";
+		try (FileInputStream fis = new FileInputStream(new File(docxPath)); XWPFDocument doc = new XWPFDocument(fis)) {
+			System.out.println("[INFO] Starting extraction of document: " + docxPath);
+			LinkedHashMap<String, Object> extractedData = extractDataFromDocument(doc);
+			System.out.println("[INFO] Extraction complete. Outputting JSON:");
+			printJson(extractedData);
+		}
+	}
+
+	public static LinkedHashMap<String, Object> extractDataFromDocument(XWPFDocument document) throws IOException {
+		LinkedHashMap<String, Object> result = new LinkedHashMap<>();
+
+		System.out.println("[DEBUG] --- TABLE EXTRACTION ---");
+		for (XWPFTable table : document.getTables()) {
+			for (XWPFTableRow row : table.getRows()) {
+				List<XWPFTableCell> cells = row.getTableCells();
+				// Handle even row pairs: label-value
+				if (cells.size() > 1) {
+					for (int i = 0; i < cells.size() - 1; i += 2) {
+						String rawLabel = KeyBuilder.extractLabel(cells.get(i).getText().trim());
+						String key = FieldKeyMap.getCanonicalKey(rawLabel);
+						String value = cleanValue(cells.get(i + 1).getText().trim());
+						System.out.println(
+								"[TABLE] Label='" + rawLabel + "' | Key='" + key + "' | Value='" + value + "'");
+						if (key != null && isValidValue(value, key)) {
+							result.put(key, value);
+							System.out.println("[TABLE] INCLUDED: " + key + " = " + value);
+						} else {
+							System.out.println("[TABLE] FILTERED: " + key + " = " + value);
+						}
+					}
+				}
+				// Handle single cell row: try to extract label:value inside the cell
+				if (cells.size() == 1) {
+					String cellText = cells.get(0).getText().trim();
+					Matcher m = Pattern.compile("^(.{2,}?):\\s*(.+)$").matcher(cellText);
+					if (m.matches()) {
+						String rawLabel = KeyBuilder.extractLabel(m.group(1).trim());
+						String key = FieldKeyMap.getCanonicalKey(rawLabel);
+						String value = cleanValue(m.group(2).trim());
+						System.out.println(
+								"[TABLE-1CELL] Label='" + rawLabel + "' | Key='" + key + "' | Value='" + value + "'");
+						if (key != null && isValidValue(value, key)) {
+							result.put(key, value);
+							System.out.println("[TABLE-1CELL] INCLUDED: " + key + " = " + value);
+						} else {
+							System.out.println("[TABLE-1CELL] FILTERED: " + key + " = " + value);
+						}
+					}
+				}
+			}
+		}
+
+		System.out.println("[DEBUG] --- PARAGRAPH & CELL TEXT EXTRACTION ---");
+		// Gather all lines from paragraphs and table cells
+		List<String> allLines = new ArrayList<>();
+		for (XWPFParagraph para : document.getParagraphs()) {
+			String text = para.getText().trim();
+			if (!text.isEmpty()) {
+				allLines.add(text);
+				System.out.println("[PARA] " + text);
+			}
+		}
+		for (XWPFTable table : document.getTables()) {
+			for (XWPFTableRow row : table.getRows()) {
+				for (XWPFTableCell cell : row.getTableCells()) {
+					String text = cell.getText().trim();
+					if (!text.isEmpty()) {
+						allLines.add(text);
+						System.out.println("[CELL] " + text);
+					}
+				}
+			}
+		}
+
+		// Parse lines for label: value or label\nvalue patterns
+		Pattern labelColonPattern = Pattern.compile("^(.{2,}?):\\s*(.+)$");
+		for (int i = 0; i < allLines.size(); i++) {
+			String line = allLines.get(i);
+			Matcher m = labelColonPattern.matcher(line);
+			if (m.matches()) {
+				String rawLabel = KeyBuilder.extractLabel(m.group(1).trim());
+				String key = FieldKeyMap.getCanonicalKey(rawLabel);
+				String value = cleanValue(m.group(2).trim());
+				System.out.println("[LINE] Label='" + rawLabel + "' | Key='" + key + "' | Value='" + value + "'");
+				if (key != null && isValidValue(value, key)) {
+					result.put(key, value);
+					System.out.println("[LINE] INCLUDED: " + key + " = " + value);
+				} else {
+					System.out.println("[LINE] FILTERED: " + key + " = " + value);
+				}
+			} else if (line.endsWith(":") && (i + 1) < allLines.size()) {
+				// Label on one line, value on next
+				String rawLabel = KeyBuilder.extractLabel(line.substring(0, line.length() - 1).trim());
+				String key = FieldKeyMap.getCanonicalKey(rawLabel);
+				String value = cleanValue(allLines.get(i + 1).trim());
+				System.out.println("[LINE-NEXT] Label='" + rawLabel + "' | Key='" + key + "' | Value='" + value + "'");
+				if (key != null && isValidValue(value, key)) {
+					result.put(key, value);
+					System.out.println("[LINE-NEXT] INCLUDED: " + key + " = " + value);
+				} else {
+					System.out.println("[LINE-NEXT] FILTERED: " + key + " = " + value);
+				}
+			}
+		}
+
+		// Fallback: parse combined text sections for narrative/complex sections
+		StringBuilder textBuilder = new StringBuilder();
+		for (String line : allLines)
+			textBuilder.append(line).append("\n");
+		parseTextSections(textBuilder.toString(), result);
+
+		return flattenAndCleanResult(result);
+	}
+
+	private static void parseTextSections(String text, Map<String, Object> result) {
+		String[] lines = text.split("\\r?\\n");
+		String section = null, lastKey = null, currentSubgroup = null;
+		boolean inNarrative = false;
+		StringBuilder narrativeBuilder = new StringBuilder();
+
+		Pattern sectionPattern = Pattern.compile("^\\d+\\.\\s*([^-:\\n]+)");
+		Pattern combinedPattern = Pattern.compile("([A-Za-z0-9_' \\-/\\(\\)&\\[\\].,#*’]+):\\s*([☒☑☐])" + "|"
+				+ "([☒☑☐])\\s*([^☒☑☐:\\n]+?)(?=\\s*[☒☑☐]|\\s+[A-Za-z0-9_'\\-/\\(\\)&\\[\\].,#*’ ]+?:|:|$)" + "|"
+				+ "([A-Za-z0-9_'\\-/\\(\\)&\\[\\].,#*’ ]+?):\\s*([^:]+?)(?=\\s+[A-Za-z0-9_'\\-/\\(\\)&\\[\\].,#*’ ]+?:|$)");
+
+		Map<String, Integer> labelCountMap = new HashMap<>();
+		boolean justSawEventProblemCheckboxes = false;
+		Set<String> eventProblemCheckboxKeys = Set.of("Hcp", "Other Caregiver", "Patient", "N/A");
+
+		for (int i = 0; i < lines.length; i++) {
+			String line = lines[i].trim();
+			System.out.println("Line " + line);
+			if (line.isEmpty())
+				continue;
+
+			// --- FIX: Remedial Action Narrative & Wand Number extraction ---
+			if (line.toLowerCase().contains("specify if/what action was taken")) {
+				// Try to extract value (narrative) from this or next line
+				String remedialVal = null;
+				Matcher remedialMatcher = Pattern.compile("^.{2,}:(.+)$").matcher(line);
+				if (remedialMatcher.find()) {
+					remedialVal = remedialMatcher.group(1).trim();
+				} else if ((i + 1) < lines.length && !lines[i + 1].trim().isEmpty()) {
+					remedialVal = lines[i + 1].trim();
+					i++; // skip narrative value line
+				}
+				String remedialKey = FieldKeyMap.getCanonicalKey("Remedial Actions/Corrective Action/Preventive Action");
+				if (remedialKey != null && remedialVal != null && isValidValue(remedialVal, remedialKey)) {
+					result.put(remedialKey, remedialVal);
+					System.out.println("[parseTextSections] INCLUDED (fix): " + remedialKey + " = " + remedialVal);
+					// If next line is a number, it's Wand Number
+					if ((i + 1) < lines.length && lines[i + 1].trim().matches("\\d+")) {
+						String wandVal = lines[i + 1].trim();
+						String wandKey = FieldKeyMap.getCanonicalKey("Wand Number");
+						result.put(wandKey, wandVal);
+						System.out.println("[parseTextSections] INCLUDED (fix): " + wandKey + " = " + wandVal);
+						i++; // skip wand number line
+					}
+					continue; // skip rest of this iteration (do not process as any other pattern)
+				}
+			}
+			// --- END FIX ---
+
+			Matcher sectionMatcher = sectionPattern.matcher(line);
+			if (sectionMatcher.find()) {
+				flushNarrative(result, lastKey, narrativeBuilder, inNarrative, section, currentSubgroup, labelCountMap);
+				section = normalizeSectionName(sectionMatcher.group(1));
+				currentSubgroup = null;
+				inNarrative = false;
+				lastKey = null;
+				justSawEventProblemCheckboxes = false;
+				continue;
+			}
+
+			if (isStrongHeading(line)) {
+				flushNarrative(result, lastKey, narrativeBuilder, inNarrative, section, currentSubgroup, labelCountMap);
+				section = normalizeSectionName(line);
+				currentSubgroup = null;
+				inNarrative = false;
+				lastKey = null;
+				justSawEventProblemCheckboxes = false;
+				continue;
+			}
+
+			if (isTableBoundary(line)) {
+				flushNarrative(result, lastKey, narrativeBuilder, inNarrative, section, currentSubgroup, labelCountMap);
+				inNarrative = false;
+				lastKey = null;
+				justSawEventProblemCheckboxes = false;
+			}
+
+			if (line.endsWith(":") && line.length() > 3 && !line.matches(".*:.*:.*")) {
+				boolean foundGroup = false;
+				if (i + 1 < lines.length) {
+					String nextLine = lines[i + 1].trim();
+					if (!nextLine.isEmpty() && (nextLine.matches(".*[☒☑☐].*") || nextLine.matches(".*?:\\s*.*"))) {
+						foundGroup = true;
+					}
+				}
+				if (foundGroup) {
+					currentSubgroup = normalizeSectionName(line.replace(":", "").trim());
+					continue;
+				}
+			}
+
+			if (justSawEventProblemCheckboxes) {
+				if (!looksLikeGroupingOrInstruction(line) && !isLikelyLabelOrHeader(line)
+						&& !line.matches(".*[☒☑☐].*")) {
+					if ("Description Of The Clinical Event Problem"
+							.equalsIgnoreCase(section.replace("_", " ").trim())) {
+						String label = "Narrative";
+						String canonicalKey = FieldKeyMap.getCanonicalKey(label);
+						if (canonicalKey != null) {
+							result.put(canonicalKey, cleanValue(line));
+						}
+						justSawEventProblemCheckboxes = false;
+					}
+				}
+			}
+
+			if (inNarrative && lastKey != null) {
+				if (line.isEmpty())
+					continue;
+				if (looksLikeGroupingOrInstruction(line) || isTableBoundary(line)) {
+					if (narrativeBuilder.length() > 0 && lastKey != null) {
+						String narrative = cleanValue(narrativeBuilder.toString());
+						if (narrative != null && isValidValue(narrative, lastKey)) {
+							result.put(lastKey, narrative);
+						}
+					}
+					narrativeBuilder.setLength(0);
+					inNarrative = false;
+					lastKey = null;
+					continue;
+				}
+				if ((line.endsWith(":") && line.length() > 1)
+						|| line.contains("Remedial Actions/Corrective Action/Preventive Action")) {
+					if (narrativeBuilder.length() > 0 && lastKey != null) {
+						String narrative = cleanValue(narrativeBuilder.toString());
+						if (narrative != null && isValidValue(narrative, lastKey)) {
+							result.put(lastKey, narrative);
+						}
+					}
+					narrativeBuilder.setLength(0);
+					String label = extractLabel(line.replace(":", "").trim());
+					String canonicalKey = FieldKeyMap.getCanonicalKey(label);
+					lastKey = canonicalKey;
+					inNarrative = true;
+					continue;
+				}
+				Matcher m = Pattern.compile("^([A-Za-z0-9_'\\-/\\(\\)&\\[\\].,#*’ ]+?):\\s*(.*)$").matcher(line);
+				if (m.find()) {
+					if (narrativeBuilder.length() > 0 && lastKey != null) {
+						String narrative = cleanValue(narrativeBuilder.toString());
+						if (narrative != null && isValidValue(narrative, lastKey)) {
+							result.put(lastKey, narrative);
+						}
+					}
+					narrativeBuilder.setLength(0);
+					String label = m.group(1).trim();
+					String value = cleanValue(m.group(2));
+					String canonicalKey = FieldKeyMap.getCanonicalKey(extractLabel(label));
+					Object parsedValue = parsePossibleBooleanOrDate(value, label);
+					if (canonicalKey != null) {
+						result.put(canonicalKey, parsedValue);
+						lastKey = canonicalKey;
+					}
+					inNarrative = false;
+					continue;
+				}
+				if (narrativeBuilder.length() > 0)
+					narrativeBuilder.append(" ");
+				narrativeBuilder.append(line);
+				continue;
+			}
+
+			if (looksLikeGroupingOrInstruction(line)) {
+				continue;
+			}
+
+			Matcher matcher = combinedPattern.matcher(line);
+			boolean matchedAny = false;
+			boolean allCheckBoxLine = true;
+			Set<String> foundCheckboxLabels = new HashSet<>();
+			while (matcher.find()) {
+				matchedAny = true;
+				String label = null;
+				Object value = null;
+				if (matcher.group(1) != null && matcher.group(2) != null) {
+					label = matcher.group(1);
+					value = matcher.group(2).equals("☒") || matcher.group(2).equals("☑");
+				} else if (matcher.group(3) != null && matcher.group(4) != null) {
+					label = matcher.group(4);
+					value = matcher.group(3).equals("☒") || matcher.group(3).equals("☑");
+				} else if (matcher.group(5) != null && matcher.group(6) != null) {
+					label = matcher.group(5);
+					value = cleanValue(matcher.group(6));
+				}
+				if (label != null) {
+					String canonicalKey = FieldKeyMap.getCanonicalKey(extractLabel(label.trim()));
+					if (canonicalKey != null && isValidValue(value, canonicalKey)) {
+						result.put(canonicalKey, value);
+						lastKey = canonicalKey;
+					}
+					if (eventProblemCheckboxKeys.contains(label.trim()))
+						foundCheckboxLabels.add(label.trim());
+					else
+						allCheckBoxLine = false;
+				}
+			}
+
+			if (matchedAny && allCheckBoxLine && section != null
+					&& "Description Of The Clinical Event Problem".equalsIgnoreCase(section.replace("_", " ").trim())) {
+				if (!foundCheckboxLabels.isEmpty()) {
+					justSawEventProblemCheckboxes = true;
+				}
+			} else if (matchedAny) {
+				justSawEventProblemCheckboxes = false;
+			}
+
+			if (!matchedAny && line.endsWith(":") && line.length() > 3) {
+				flushNarrative(result, lastKey, narrativeBuilder, inNarrative, section, currentSubgroup, labelCountMap);
+				String keyBase = FieldKeyMap.getCanonicalKey(extractLabel(line.replace(":", "").trim()));
+				if (keyBase != null && keyBase.endsWith("_M_F"))
+					keyBase = keyBase.replace("_M_F", "_Gender");
+				if (keyBase != null) {
+					String key = makeUniqueKey(keyBase, labelCountMap);
+					lastKey = key;
+					inNarrative = true;
+				} else {
+					// Optionally log or handle missing keys
+					lastKey = null;
+					inNarrative = false;
+				}
+				continue;
+			}
+			if (!matchedAny && isTableBoundary(line) && i + 1 < lines.length) {
+				String nextLine = lines[i + 1].trim();
+				if (!nextLine.isEmpty() && !isTableBoundary(nextLine) && !looksLikeGroupingOrInstruction(nextLine)) {
+					String keyBase;
+					if (line.toLowerCase().contains("wand number")) {
+						String canonicalKey = FieldKeyMap.getCanonicalKey(extractLabel(line));
+						result.put(canonicalKey, cleanValue(nextLine));
+					} else {
+						keyBase = FieldKeyMap.getCanonicalKey(extractLabel(line));
+						String key = makeUniqueKey(keyBase, labelCountMap);
+						Object value = parsePossibleBooleanOrDate(cleanValue(nextLine), line);
+						result.put(key, value);
+					}
+					i++;
+					continue;
+				}
+			}
+
+			if (lastKey != null && !isLikelyLabelOrHeader(line) && !matchedAny && !inNarrative) {
+				Object value = parsePossibleBooleanOrDate(cleanValue(line), lastKey);
+				if (lastKey.endsWith("_M_F"))
+					value = extractGender(value.toString());
+				if (value instanceof String)
+					value = removeTrailingGroupingText((String) value);
+				if (isValidValue(value, lastKey)) {
+					if ("NZ_Description_Of_The_Clinical_Event_Problem_N_A".equals(lastKey)) {
+						String narrativeKey = "NZ_Description_Of_The_Clinical_Event_Problem_Narrative";
+						result.put(narrativeKey, value);
+					} else {
+						result.put(lastKey, value);
+					}
+				}
+				lastKey = null;
+				justSawEventProblemCheckboxes = false;
+			}
+		}
+		flushNarrative(result, lastKey, narrativeBuilder, inNarrative, section, currentSubgroup, labelCountMap);
+	}
+	/**
+	 * Cleans extracted values by trimming, removing unwanted brackets, and trailing
+	 * groupings.
+	 *
+	 * @param value The raw value string.
+	 * @return Cleaned value string.
+	 */
+	private static String cleanValue(String value) {
+		if (value == null)
+			return null;
+		String trimmed = value.trim();
+		trimmed = trimmed.replaceAll("^\\([^\\)]*\\)\\s*", "");
+		trimmed = removeTrailingGroupingText(trimmed);
+		return trimmed.trim();
+	}
+
+	/**
+	 * Checks if a line in the PDF is a table boundary (used as a section
+	 * delimiter).
+	 *
+	 * @param line The line of text.
+	 * @return True if the line is a table boundary.
+	 */
+	private static boolean isTableBoundary(String line) {
+		String l = line.trim().toLowerCase();
+		return l.startsWith("list of other devices involved") || l.startsWith("if other implants involved")
+				|| l.startsWith("mfr/sponsor aware of other similar events")
+				|| l.startsWith("country where these similar adverse events occurred")
+				|| l.startsWith("additional comments");
+	}
+
+	/**
+	 * Extracts a clean label from a field name or label.
+	 *
+	 * @param label The label string.
+	 * @return The cleaned label.
+	 */
+	private static String extractLabel(String label) {
+		if (label == null)
+			return "";
+		label = label.replaceAll("\\*", "").trim();
+		label = label.replaceAll("^[^A-Za-z0-9']+", ""); // allow '
+		String[] groupingWords = { "indicate", "select", "choose", "tick", "check", "please", "provide", "enter",
+				"describe", "for details see", "see", "if the device", "is the device", "attach" };
+		String lower = label.toLowerCase();
+		for (String grp : groupingWords) {
+			if (lower.startsWith(grp)) {
+				label = label.substring(grp.length()).trim();
+				lower = label.toLowerCase();
+			}
+		}
+		String[] words = label.trim().split("\\s+|_");
+		label = String.join(" ", words);
+		if (label.equalsIgnoreCase("M/F")) {
+			label = "Gender";
+		}
+		return label;
+	}
+
+	/**
+	 * Normalizes section headings by removing numbers, extra spaces, and trailing
+	 * instructions.
+	 *
+	 * @param raw The raw section heading.
+	 * @return The normalized section name.
+	 */
+	private static String normalizeSectionName(String raw) {
+		if (raw == null)
+			return "";
+		String s = raw.replaceAll("\\b\\d+\\.?\\b", "").replaceAll("\\s{2,}", " ").trim();
+		String[] splitters = { " if ", " indicate", ":", "-", " please", " select", " choose", " tick", " check" };
+		for (String splitter : splitters) {
+			int idx = s.toLowerCase().indexOf(splitter);
+			if (idx > 0)
+				s = s.substring(0, idx).trim();
+		}
+		return s;
+	}
+
+	/**
+	 * Parses a string value as a boolean ('yes'/'no'), date (if label contains
+	 * 'date'), or as-is.
+	 *
+	 * @param s     The value string.
+	 * @param label The key or label (for detecting dates).
+	 * @return Parsed boolean, date, or original string.
+	 */
+	private static Object parsePossibleBooleanOrDate(String s, String label) {
+		if (s.equalsIgnoreCase("true") || s.equalsIgnoreCase("yes"))
+			return true;
+		if (s.equalsIgnoreCase("false") || s.equalsIgnoreCase("no"))
+			return false;
+		if (label != null && label.toLowerCase().contains("date")) {
+			Matcher m = Pattern.compile("(\\d{1,2}/\\d{1,2}/\\d{4})").matcher(s);
+			if (m.find())
+				return m.group(1);
+		}
+		return s;
+	}
+
+	/**
+	 * Removes trailing grouping or heading-like words from a value string.
+	 *
+	 * @param value The input string.
+	 * @return The string without trailing groupings.
+	 */
+	private static String removeTrailingGroupingText(String value) {
+		if (value == null)
+			return null;
+		String trimmed = value.trim();
+		String[] groupings = { "specific device information", "device information", "patient information",
+				"event information", "details", "narrative", "summary", "category", "type", "manufacturer", "model",
+				"catalog", "other", "comments", "notes", "example", "section", "subsection", "grouping", "header",
+				"heading", "description", "explanation" };
+		for (String grouping : groupings) {
+			String pattern = "(?i)\\b" + Pattern.quote(grouping) + "\\b\\.?$";
+			trimmed = trimmed.replaceAll(pattern, "").trim();
+		}
+		return trimmed;
+	}
+
+	/**
+	 * Appends and saves a multi-line narrative value to the result map if present.
+	 *
+	 * @param result           The output map.
+	 * @param lastKey          The relevant key to update.
+	 * @param narrativeBuilder The StringBuilder holding the current narrative.
+	 * @param inNarrative      Whether currently inside a narrative.
+	 * @param section          The current section.
+	 * @param currentSubgroup  The current subgroup.
+	 * @param labelCountMap    Map to help with key uniqueness.
+	 */
+	private static void flushNarrative(Map<String, Object> result, String lastKey, StringBuilder narrativeBuilder,
+			boolean inNarrative, String section, String currentSubgroup, Map<String, Integer> labelCountMap) {
+		if (inNarrative && lastKey != null && narrativeBuilder.length() > 0
+				&& isValidValue(narrativeBuilder.toString(), lastKey)) {
+			String narrative = cleanValue(narrativeBuilder.toString());
+			if (lastKey.endsWith("_Gender")) {
+				narrative = extractGender(narrative);
+			}
+			Matcher trailingNumber = Pattern.compile("^(.*?)(\\s+)(\\d+)$").matcher(narrative);
+			if (trailingNumber.matches()) {
+				String mainText = trailingNumber.group(1).trim();
+				String trailing = trailingNumber.group(3);
+				result.put(lastKey, mainText);
+				String wandKey = FieldKeyMap.getCanonicalKey(extractLabel("wand number"));
+				result.put(wandKey, trailing);
+			} else {
+				result.put(lastKey, narrative);
+			}
+		}
+		narrativeBuilder.setLength(0);
+	}
+
+	/**
+	 * Determines if a line appears to be a grouping or instructional (not data).
+	 *
+	 * @param line The line of text.
+	 * @return True if the line is a grouping/instruction.
+	 */
+	private static boolean looksLikeGroupingOrInstruction(String line) {
+		String lower = line.toLowerCase().trim();
+		if (lower.matches(
+				"^(specific )?(device|patient|event|report|information|details|narrative|summary|category|type|model|serial|lot|catalog|brand|other|comments|notes|example|section|subsection|grouping|header|heading|description|explanation)[ .:-]*$")) {
+			return true;
+		}
+		if (lower.startsWith("(") && lower.endsWith(")"))
+			return true;
+		if (lower.contains("indicate") || lower.contains("see definition") || lower.contains("category")
+				|| lower.contains("grouping") || lower.contains("instruction")
+				|| lower.contains("report category (see definitions")
+				|| lower.contains("both implant date and explant dates") || lower.startsWith("for details see")
+				|| lower.startsWith("please") || lower.startsWith("attach") || lower.startsWith("if the device")
+				|| lower.contains("resolution of event and outcomes") || lower.contains("patient focused"))
+			return true;
+		if (lower.matches("^\\(.*\\)$"))
+			return true;
+		return false;
+	}
+
+	/**
+	 * Detects strong section headings.
+	 *
+	 * @param line The line of text.
+	 * @return True if the line is a strong heading.
+	 */
+	private static boolean isStrongHeading(String line) {
+		String l = line.trim();
+		return l.matches("^(Remedial Actions/Corrective Action/Preventive Action|Other Reporting Information)$");
+	}
+
+	/**
+	 * Checks if a line is likely to be a label or header (ends with colon, very
+	 * short, or all caps).
+	 *
+	 * @param line The line of text.
+	 * @return True if the line is likely a label/header.
+	 */
+	private static boolean isLikelyLabelOrHeader(String line) {
+		return line.endsWith(":") || line.length() < 3 || line.equals(line.toUpperCase());
+	}
+
+	/**
+	 * Determines if a value is valid for inclusion in the output (not empty, not
+	 * guidance text, etc).
+	 *
+	 * @param value The value.
+	 * @param key   The key (for some special exclusions).
+	 * @return True if valid.
+	 */
+	private static boolean isValidValue(Object value, String key) {
+		if (value == null)
+			return false;
+		String val = value.toString().trim();
+		if (val.isEmpty())
+			return false;
+		String lower = val.toLowerCase();
+		if (lower.equals("not applicable"))
+			return false;
+		if (lower.startsWith("(") && lower.endsWith(")"))
+			return false;
+		if (lower.startsWith("please submit") || lower.contains("submit an initial report")
+				|| lower.contains("submit a final report") || lower.startsWith("provide as much detail")
+				|| lower.contains("see guidance") || lower.startsWith("specify") || lower.contains("attach")
+				|| lower.startsWith("note:") || lower.startsWith("example:") || lower.startsWith("for example:")
+				|| lower.startsWith("email:") || lower.matches("^\\*?age:?$") || lower.matches("^\\*?wt.\\(kg\\):?$")
+				|| lower.matches("^\\*?m/f:?$") || lower.contains("guidance") || lower.equals("none")
+				|| lower.equals("click here to enter text") || lower.contains("send this form to")
+				|| lower.startsWith("if there have been other similar events reported")
+				|| lower.contains("if none, write") || lower.matches("^\\W*$")
+				|| lower.contains("the first report that the reporter")
+				|| lower.contains("submit this report when the investigation is complete")
+				|| lower.contains("number should include the number sold")
+				|| lower.contains("in some cases, the patient’s age") || lower.contains("incidence rate")
+				|| lower.contains("should preferably be provided in the form of an incidence rate")
+				|| lower.contains("this investigation should include details such as")
+				|| lower.contains("critical information that should be provided includes")
+				|| lower.contains("report types") || lower.contains("clinical event information")
+				|| lower.contains("manufacturer’s investigation") || lower.contains("harm definitions")
+				|| lower.contains("where required, to provide an update to a previous report")
+				|| lower.contains("report category") || lower.startsWith("●")
+				|| lower.contains("investigation is not yet complete and the final report not available.")
+				|| lower.contains("(specify if/what action was taken for the reported specific event or")
+				|| lower.contains("compliance management branch, medsafe, po box 5013, wellington, 6145.")
+				|| lower.contains("devices@health.govt.nz")
+				|| lower.contains("If other implants involved – list brand, model & WAND number."))
+			return false;
+		String lowerKey = key != null ? key.toLowerCase() : "";
+		if (lowerKey.endsWith("note") || lowerKey.endsWith("example"))
+			return false;
+		if (val.length() < 2 && !val.equalsIgnoreCase("no"))
+			return false;
+		return true;
+	}
+
+	/**
+	 * Flattens and cleans up the extracted results, ensuring unnecessary keys are
+	 * omitted.
+	 *
+	 * @param map The extracted data map.
+	 * @return A cleaned LinkedHashMap ready for output.
+	 */
+	private static LinkedHashMap<String, Object> flattenAndCleanResult(Map<String, Object> map) {
+		LinkedHashMap<String, Object> cleaned = new LinkedHashMap<>();
+		map.forEach((key, value) -> {
+			if (isValidValue(value, key)) {
+				cleaned.put(key, value);
+			}
+		});
+		return cleaned;
+	}
+
+	/**
+	 * Makes a key unique by appending a number if it already exists in the
+	 * labelCountMap.
+	 *
+	 * @param base          The base key.
+	 * @param labelCountMap Map for tracking occurrence counts for each key.
+	 * @return A unique key string.
+	 */
+	private static String makeUniqueKey(String base, Map<String, Integer> labelCountMap) {
+		int count = labelCountMap.merge(base, 1, Integer::sum);
+		return count == 1 ? base : base + "_" + count;
+	}
+
+	/**
+	 * Pretty-prints an object as JSON.
+	 *
+	 * @param obj The object to print.
+	 * @throws IOException If serialization fails.
+	 */
+	public static void printJson(Object obj) throws IOException {
+		ObjectMapper mapper = new ObjectMapper();
+		mapper.enable(SerializationFeature.INDENT_OUTPUT);
+		String json = mapper.writeValueAsString(obj);
+		System.out.println("\n--- FINAL JSON OUTPUT ---\n" + json);
+	}
+
+	/**
+	 * Extracts the gender from a raw input string, normalizing to "Male", "Female",
+	 * or "Other" if detected.
+	 *
+	 * @param raw The raw string.
+	 * @return The normalized gender string, or the original if not matched.
+	 */
+	private static String extractGender(String raw) {
+		if (raw == null)
+			return null;
+		String lower = raw.trim().toLowerCase();
+		if (lower.startsWith("male"))
+			return "Male";
+		if (lower.startsWith("female"))
+			return "Female";
+
+		String[] words = raw.trim().split("\\s+");
+		if (words.length > 0) {
+			String first = words[0].toLowerCase();
+			if (first.equals("male") || first.equals("female")) {
+				return Character.toUpperCase(first.charAt(0)) + first.substring(1).toLowerCase();
+			}
+		}
+		return raw;
+	}
+}
